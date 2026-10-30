@@ -15,9 +15,10 @@ warnings = "deny"
 
 [dependencies]
 crossterm = { version = "0.29.0", default-features = false, features = ["events", "windows"] }
+exarmo-aarch64 = "0.4.0"
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "fast_fmt", "code_asm", "instr_info"] }
 memchr = "2.8.3"
-object = { version = "0.40.0", default-features = false, features = ["read_core", "pe", "std"] }
+object = { version = "0.40.0", default-features = false, features = ["read_core", "pe", "std", "macho"] }
 rustc-hash = "2.1.3"
 tempfile = "3.27.0"
 unicode-width = "0.2.2"

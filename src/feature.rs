@@ -277,8 +277,8 @@ pub fn prepare(
     }
     for (path, targets) in files {
         progress.check()?;
-        let image = match Image::parse(&store.files[&path].original) {
-            Ok(image) => image,
+        let images = match Image::parse(&store.files[&path].original) {
+            Ok(images) => images,
             Err(error) => {
                 for (index, _) in targets {
                     prepared[index].edits = Err(format!("{}：{error}", store::display(&path)));
@@ -286,113 +286,115 @@ pub fn prepare(
                 continue;
             }
         };
-        let mut found = Vec::new();
-        for (index, target) in targets {
-            if prepared[index].edits.is_err() {
-                continue;
-            }
-            progress.check()?;
-            match (target.find)(&image, progress) {
-                Ok(symbols) => {
-                    let analysis = (target.scan)(symbols.clone());
-                    found.push((index, symbols, analysis, Vec::new()));
-                }
-                Err(error) => {
-                    let error = error.to_string();
-                    progress.fail(&error);
-                    prepared[index].edits = Err(error);
-                }
-            }
-        }
-        if found.is_empty() {
-            continue;
-        }
-        let labels = found
-            .iter()
-            .flat_map(|(_, symbols, _, _)| symbols)
-            .flat_map(|(name, addresses)| {
-                addresses
-                    .iter()
-                    .map(move |address| (*address, name.trim_end_matches('\0').to_owned()))
-            })
-            .collect();
-        let mut listeners: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
-        for (index, (_, symbols, _, _)) in found.iter().enumerate() {
-            for address in symbols.values().flatten() {
-                listeners.entry(*address).or_default().push(index);
-            }
-        }
-        let name = path.file_name().unwrap_or_default().to_string_lossy();
-        let references =
-            match image.references(&name, labels, progress, |references, function, changed| {
-                let listeners: BTreeSet<_> = changed
-                    .iter()
-                    .flat_map(|address| &listeners[address])
-                    .copied()
-                    .collect();
-                for listener in listeners {
-                    progress.check()?;
-                    let (index, _, analysis, common) = &mut found[listener];
-                    if prepared[*index].edits.is_err() {
-                        continue;
-                    }
-                    let progress = progress.group(features[*index].name);
-                    match analysis.visit(&image, function, references, &progress) {
-                        Ok(edits) => common.extend(edits),
-                        Err(error) => {
-                            let error = error.to_string();
-                            progress.fail(&error);
-                            prepared[*index].edits = Err(error);
-                        }
-                    }
-                }
-                Ok(())
-            }) {
-                Ok(references) => references,
-                Err(error) => {
-                    progress.fail(&error.to_string());
-                    for (index, _, _, _) in found {
-                        prepared[index].edits = Err(error.to_string());
-                    }
+        for image in &images {
+            let mut found = Vec::new();
+            for (index, target) in targets.iter().copied() {
+                if prepared[index].edits.is_err() {
                     continue;
                 }
-            };
-        for (index, _, analysis, common) in found {
-            progress.check()?;
-            if prepared[index].edits.is_err() {
-                continue;
-            }
-            let progress = progress.group(features[index].name);
-            let resources = analysis.resources();
-            match analysis.finish(&image, &references, &progress) {
-                Ok(modes) => {
-                    if let Ok(choices) = &mut prepared[index].edits {
-                        for mode in modes {
-                            let choice =
-                                match choices.iter().position(|choice| choice.id == mode.id) {
-                                    Some(index) => &mut choices[index],
-                                    None => {
-                                        choices.push(Mode {
-                                            id: mode.id,
-                                            name: mode.name,
-                                            edits: Edits::new(),
-                                        });
-                                        choices.last_mut().expect("mode")
-                                    }
-                                };
-                            let edits = choice.edits.entry(path.clone()).or_default();
-                            edits.extend(common.iter().cloned());
-                            edits.extend(mode.edits);
-                        }
+                progress.check()?;
+                match (target.find)(image, progress) {
+                    Ok(symbols) => {
+                        let analysis = (target.scan)(symbols.clone());
+                        found.push((index, symbols, analysis, Vec::new()));
                     }
-                    if !resources.is_empty() {
-                        prepared[index].resources.insert(path.clone(), resources);
+                    Err(error) => {
+                        let error = error.to_string();
+                        progress.fail(&error);
+                        prepared[index].edits = Err(error);
                     }
                 }
-                Err(error) => {
-                    let error = error.to_string();
-                    progress.fail(&error);
-                    prepared[index].edits = Err(error);
+            }
+            if found.is_empty() {
+                continue;
+            }
+            let labels = found
+                .iter()
+                .flat_map(|(_, symbols, _, _)| symbols)
+                .flat_map(|(name, addresses)| {
+                    addresses
+                        .iter()
+                        .map(move |address| (*address, name.trim_end_matches('\0').to_owned()))
+                })
+                .collect();
+            let mut listeners: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+            for (index, (_, symbols, _, _)) in found.iter().enumerate() {
+                for address in symbols.values().flatten() {
+                    listeners.entry(*address).or_default().push(index);
+                }
+            }
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let references =
+                match image.references(&name, labels, progress, |references, function, changed| {
+                    let listeners: BTreeSet<_> = changed
+                        .iter()
+                        .flat_map(|address| &listeners[address])
+                        .copied()
+                        .collect();
+                    for listener in listeners {
+                        progress.check()?;
+                        let (index, _, analysis, common) = &mut found[listener];
+                        if prepared[*index].edits.is_err() {
+                            continue;
+                        }
+                        let progress = progress.group(features[*index].name);
+                        match analysis.visit(image, function, references, &progress) {
+                            Ok(edits) => common.extend(edits),
+                            Err(error) => {
+                                let error = error.to_string();
+                                progress.fail(&error);
+                                prepared[*index].edits = Err(error);
+                            }
+                        }
+                    }
+                    Ok(())
+                }) {
+                    Ok(references) => references,
+                    Err(error) => {
+                        progress.fail(&error.to_string());
+                        for (index, _, _, _) in found {
+                            prepared[index].edits = Err(error.to_string());
+                        }
+                        continue;
+                    }
+                };
+            for (index, _, analysis, common) in found {
+                progress.check()?;
+                if prepared[index].edits.is_err() {
+                    continue;
+                }
+                let progress = progress.group(features[index].name);
+                let resources = analysis.resources();
+                match analysis.finish(image, &references, &progress) {
+                    Ok(modes) => {
+                        if let Ok(choices) = &mut prepared[index].edits {
+                            for mode in modes {
+                                let choice =
+                                    match choices.iter().position(|choice| choice.id == mode.id) {
+                                        Some(index) => &mut choices[index],
+                                        None => {
+                                            choices.push(Mode {
+                                                id: mode.id,
+                                                name: mode.name,
+                                                edits: Edits::new(),
+                                            });
+                                            choices.last_mut().expect("mode")
+                                        }
+                                    };
+                                let edits = choice.edits.entry(path.clone()).or_default();
+                                edits.extend(common.iter().cloned());
+                                edits.extend(mode.edits);
+                            }
+                        }
+                        if !resources.is_empty() {
+                            prepared[index].resources.insert(path.clone(), resources);
+                        }
+                    }
+                    Err(error) => {
+                        let error = error.to_string();
+                        progress.fail(&error);
+                        prepared[index].edits = Err(error);
+                    }
                 }
             }
         }
@@ -653,7 +655,7 @@ pub fn describe(
             }) {
                 continue;
             }
-            let image = Image::parse(&file.original)?;
+            let images = Image::parse(&file.original)?;
             let step = progress.group(patch.feature.name).activity("生成文件内容");
             let mut size = 0;
             for edit in edits {
@@ -673,6 +675,10 @@ pub fn describe(
                     )
                     .expect("updated content range");
                 if before != after {
+                    let image = images
+                        .iter()
+                        .find(|image| image.contains(edit.range.start))
+                        .ok_or("修改位置不在映像中")?;
                     step.record(format!(
                         "{name}；{}",
                         image.difference(&edit.range, &file.current, &content.data)?

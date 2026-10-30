@@ -4,6 +4,7 @@ use std::{
     ffi::CStr,
     num::NonZero,
     ops::Range,
+    sync::Arc,
 };
 
 use iced_x86::{
@@ -11,12 +12,15 @@ use iced_x86::{
     InstructionBlock, Mnemonic, OpKind, Register, code_asm::CodeAssembler,
 };
 use object::endian::LittleEndian as LE;
-use object::pe;
-use object::read::pe::{Import, PeFile64};
-use object::read::{ExportTarget, NameOrOrdinal, Object, ObjectSection};
+use object::read::macho::{FatArch, MachOFatFile32, MachOFatFile64, Section};
+use object::read::pe::Import;
+use object::read::{ExportTarget, NameOrOrdinal, Object, ObjectSection, ObjectSegment};
+use object::{Architecture, FileKind, SectionKind, macho, pe};
 use rustc_hash::FxHashMap;
 
 use crate::{Result, data::Data, feature::Edit, progress::Progress, xlog::Records};
+
+mod arm64;
 
 pub type Symbols = BTreeMap<String, Vec<u64>>;
 
@@ -81,7 +85,7 @@ fn format(instructions: impl IntoIterator<Item = Instruction>) -> String {
 }
 
 pub struct References {
-    functions: Vec<Range<u64>>,
+    functions: Arc<[Range<u64>]>,
     targets: FxHashMap<u64, Callers>,
     entries: Vec<Reference>,
 }
@@ -148,33 +152,147 @@ pub fn functions(
 }
 
 pub struct Image<'a> {
-    file: PeFile64<'a>,
+    file: object::File<'a>,
+    range: Range<usize>,
+    base: u64,
+    end: u64,
+    functions: OnceCell<std::result::Result<Arc<[Range<u64>]>, String>>,
     pub logs: OnceCell<std::result::Result<Records, String>>,
 }
 
 impl<'a> Image<'a> {
-    pub fn parse(data: &'a [u8]) -> Result<Self> {
-        let file = PeFile64::parse(data)?;
-        if file.architecture() != object::Architecture::X86_64 {
-            return Err("需要 Windows x64 PE 文件".into());
+    pub fn parse(data: &'a [u8]) -> Result<Vec<Self>> {
+        let ranges: Vec<_> = match FileKind::parse(data)? {
+            FileKind::MachOFat32 => MachOFatFile32::parse(data)?
+                .arches()
+                .iter()
+                .map(FatArch::file_range)
+                .collect(),
+            FileKind::MachOFat64 => MachOFatFile64::parse(data)?
+                .arches()
+                .iter()
+                .map(FatArch::file_range)
+                .collect(),
+            _ => vec![(0, data.len() as u64)],
+        };
+        if ranges.is_empty() {
+            return Err("文件没有可分析的映像".into());
         }
-        Ok(Self {
-            file,
-            logs: OnceCell::new(),
-        })
+        ranges
+            .into_iter()
+            .map(|(offset, size)| {
+                let start = usize::try_from(offset)?;
+                let end = start
+                    .checked_add(usize::try_from(size)?)
+                    .ok_or("映像范围溢出")?;
+                let range = start..end;
+                let bytes = data.get(range.clone()).ok_or("映像范围超出文件")?;
+                let file = object::File::parse(bytes)?;
+                let (base, end) = match &file {
+                    object::File::Pe64(file) => {
+                        let base = file.relative_address_base();
+                        let size =
+                            u64::from(file.nt_headers().optional_header.size_of_image.get(LE));
+                        (base, base.checked_add(size).ok_or("映像地址溢出")?)
+                    }
+                    object::File::MachO64(file) => {
+                        let base = file
+                            .segments()
+                            .find(|segment| segment.name() == Ok(Some("__TEXT")))
+                            .ok_or("找不到 Mach-O 代码段")?
+                            .address();
+                        let end = file
+                            .segments()
+                            .try_fold(base, |end, segment| -> Result<_> {
+                                Ok(end.max(
+                                    segment
+                                        .address()
+                                        .checked_add(segment.size())
+                                        .ok_or("映像地址溢出")?,
+                                ))
+                            })?;
+                        (base, end)
+                    }
+                    _ => return Err("需要 64 位 PE 或 Mach-O 文件".into()),
+                };
+                Ok(Self {
+                    file,
+                    range,
+                    base,
+                    end,
+                    functions: OnceCell::new(),
+                    logs: OnceCell::new(),
+                })
+            })
+            .collect()
+    }
+
+    pub fn architecture(&self) -> Architecture {
+        self.file.architecture()
+    }
+
+    pub fn contains(&self, offset: usize) -> bool {
+        self.range.contains(&offset)
+    }
+
+    pub fn assembly(&self, bytes: &[u8], address: u64) -> String {
+        match self.architecture() {
+            Architecture::Aarch64 => arm64::assembly(bytes, address),
+            _ => assembly(bytes, address),
+        }
     }
 
     pub fn base(&self) -> u64 {
-        self.file.relative_address_base()
+        self.base
     }
 
     pub fn end(&self) -> u64 {
-        self.base() + u64::from(self.file.nt_headers().optional_header.size_of_image.get(LE))
+        self.end
     }
 
     pub fn imports(&self) -> Result<Symbols> {
+        match &self.file {
+            object::File::MachO64(file) => {
+                let mut found = Symbols::new();
+                let endian = file.endian();
+                let symbols = file.macho_symbol_table();
+                let mut commands = file.macho_load_commands()?;
+                while let Some(command) = commands.next()? {
+                    let Some(table) = command.dysymtab()? else {
+                        continue;
+                    };
+                    let indirect = table.indirect_symbols(endian, file.data())?;
+                    for section in file.sections() {
+                        let raw = section.macho_section();
+                        let size = match raw.symbol_stub_size(endian) {
+                            0 => 8,
+                            size => size,
+                        };
+                        for (index, symbol) in
+                            raw.indirect_symbols(endian, indirect)?.iter().enumerate()
+                        {
+                            let Some(symbol) = symbol.get(endian).index() else {
+                                continue;
+                            };
+                            let symbol = symbols.symbol(object::SymbolIndex(symbol as usize))?;
+                            let name = symbols.symbol_name(endian, symbol)?;
+                            found
+                                .entry(std::str::from_utf8(name)?.to_owned())
+                                .or_default()
+                                .push(section.address() + index as u64 * u64::from(size));
+                        }
+                    }
+                }
+                Ok(found)
+            }
+            object::File::Pe64(file) => self.pe_imports(file),
+            _ => unreachable!(),
+        }
+    }
+
+    fn pe_imports(&self, file: &object::read::pe::PeFile64<'a>) -> Result<Symbols> {
         let mut found = Symbols::new();
-        if let Some(table) = self.file.import_table()? {
+        if let Some(table) = file.import_table()? {
             let mut descriptors = table.descriptors()?;
             while let Some(descriptor) = descriptors.next()? {
                 let lookup = descriptor.original_first_thunk.get(LE);
@@ -195,7 +313,7 @@ impl<'a> Image<'a> {
                 }
             }
         }
-        if let Some(table) = self.file.delay_load_import_table()? {
+        if let Some(table) = file.delay_load_import_table()? {
             let mut descriptors = table.descriptors()?;
             while let Some(descriptor) = descriptors.next()? {
                 if descriptor.attributes.get(LE) & pe::IMAGE_DELAYLOAD_RVA_BASED == 0 {
@@ -245,18 +363,21 @@ impl<'a> Image<'a> {
                 && let Some((start, size)) = section.file_range()
                 && offset < size
             {
-                return Ok((start + offset) as usize);
+                return Ok(self.range.start + (start + offset) as usize);
             }
         }
         Err(format!("地址 {address:#x} 没有对应的文件位置").into())
     }
 
     pub fn address(&self, offset: usize) -> Result<u64> {
+        let position = offset
+            .checked_sub(self.range.start)
+            .ok_or("文件位置不在映像中")?;
         self.file
             .sections()
             .find_map(|section| {
                 let (start, size) = section.file_range()?;
-                let offset = (offset as u64).checked_sub(start)?;
+                let offset = (position as u64).checked_sub(start)?;
                 (offset < size).then_some(section.address() + offset)
             })
             .ok_or_else(|| format!("文件位置 {offset:#x} 没有对应的地址").into())
@@ -276,6 +397,18 @@ impl<'a> Image<'a> {
                 let bytes = data
                     .get(offset.min(data.len())..end.min(data.len()))
                     .expect("function content range");
+                if self.architecture() == Architecture::Aarch64 {
+                    let first = (address - function.start) as usize / 4 * 4;
+                    let end = ((address - function.start) as usize + range.len())
+                        .next_multiple_of(4)
+                        .min(bytes.len());
+                    start = Some(function.start + first as u64);
+                    values.push(self.assembly(
+                        &bytes[first.min(bytes.len())..end],
+                        function.start + first as u64,
+                    ));
+                    continue;
+                }
                 let mut instructions =
                     Decoder::with_ip(64, &bytes, function.start, DecoderOptions::NONE)
                         .into_iter()
@@ -302,6 +435,9 @@ impl<'a> Image<'a> {
     }
 
     pub fn instructions(&self, function: &Range<u64>) -> Result<Vec<Instruction>> {
+        if self.architecture() != Architecture::X86_64 {
+            return Err("该分析需要 x64 指令".into());
+        }
         let bytes = self.data(function.start, (function.end - function.start) as usize)?;
         Ok(
             Decoder::with_ip(64, bytes, function.start, DecoderOptions::NONE)
@@ -586,18 +722,8 @@ impl<'a> Image<'a> {
             let function = references.functions[index].clone();
             progress.check()?;
             let bytes = self.data(function.start, (function.end - function.start) as usize)?;
-            let mut decoder = Decoder::with_ip(64, bytes, function.start, DecoderOptions::NONE);
-            let mut instruction = Instruction::default();
             let mut changed = BTreeSet::new();
-            while decoder.can_decode() {
-                decoder.decode_out(&mut instruction);
-                let target = if instruction.is_ip_rel_memory_operand() {
-                    instruction.ip_rel_memory_address()
-                } else if instruction.op0_kind() == OpKind::NearBranch64 {
-                    instruction.near_branch_target()
-                } else {
-                    continue;
-                };
+            let mut record = |address, length, target| -> Result<()> {
                 references.insert(target, index);
                 let symbol = labels.get(&target);
                 if symbol.is_some() {
@@ -605,7 +731,7 @@ impl<'a> Image<'a> {
                 }
                 let sampled = step.sample();
                 if sampled || symbol.is_some() {
-                    let bytes = self.data(instruction.ip(), instruction.len())?;
+                    let bytes = self.data(address, length)?;
                     let label = exports.get(&function.start).or(symbol);
                     let mut detail = name.to_owned();
                     if let Some(symbol) = label {
@@ -613,13 +739,13 @@ impl<'a> Image<'a> {
                     }
                     detail.push_str(&format!(
                         "；RVA 0x{:08X}；{} → {}",
-                        instruction.ip() - self.base(),
+                        address - self.base(),
                         bytes
                             .iter()
                             .map(|byte| format!("{byte:02X}"))
                             .collect::<Vec<_>>()
                             .join(" "),
-                        assembly(bytes, instruction.ip()),
+                        self.assembly(bytes, address),
                     ));
                     if let Some(symbol) = symbol.or_else(|| exports.get(&target)) {
                         if Some(symbol) != label {
@@ -630,6 +756,31 @@ impl<'a> Image<'a> {
                     }
                     step.detail(detail);
                 }
+                Ok(())
+            };
+            match self.architecture() {
+                Architecture::X86_64 => {
+                    let mut decoder =
+                        Decoder::with_ip(64, bytes, function.start, DecoderOptions::NONE);
+                    let mut instruction = Instruction::default();
+                    while decoder.can_decode() {
+                        decoder.decode_out(&mut instruction);
+                        let target = if instruction.is_ip_rel_memory_operand() {
+                            instruction.ip_rel_memory_address()
+                        } else if instruction.op0_kind() == OpKind::NearBranch64 {
+                            instruction.near_branch_target()
+                        } else {
+                            continue;
+                        };
+                        record(instruction.ip(), instruction.len(), target)?;
+                    }
+                }
+                Architecture::Aarch64 => {
+                    arm64::references(bytes, function.start, |address, target| {
+                        record(address, 4, target)
+                    })?;
+                }
+                _ => return Err("无法分析该架构的代码引用".into()),
             }
             step.set(index as u64 + 1);
             if !changed.is_empty() {
@@ -662,8 +813,13 @@ impl<'a> Image<'a> {
     }
 
     fn unwind(&self) -> Result<&'a [[u8; 12]]> {
-        let directory = self
-            .file
+        let object::File::Pe64(file) = &self.file else {
+            return Err("该映像不使用 PE 异常展开目录".into());
+        };
+        if self.architecture() != Architecture::X86_64 {
+            return Err("无法读取该架构的 PE 异常展开目录".into());
+        }
+        let directory = file
             .data_directory(pe::IMAGE_DIRECTORY_ENTRY_EXCEPTION)
             .ok_or("找不到异常展开目录")?;
         Ok(self
@@ -676,21 +832,64 @@ impl<'a> Image<'a> {
     }
 
     pub fn function(&self, address: u64) -> Result<Option<Range<u64>>> {
-        let entries = self.unwind()?;
-        let index = entries.partition_point(|entry| {
-            let start = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
-            self.base() + start as u64 <= address
-        });
-        let Some(entry) = index.checked_sub(1).and_then(|index| entries.get(index)) else {
-            return Ok(None);
-        };
-        let start = self.base() + u32::from_le_bytes(entry[..4].try_into()?) as u64;
-        let end = self.base() + u32::from_le_bytes(entry[4..8].try_into()?) as u64;
-        let function = start..end;
-        Ok(function.contains(&address).then_some(function))
+        let functions = self.functions()?;
+        let index = functions.partition_point(|function| function.start <= address);
+        Ok(index
+            .checked_sub(1)
+            .and_then(|index| functions.get(index))
+            .filter(|function| function.contains(&address))
+            .cloned())
     }
 
-    pub fn functions(&self) -> Result<Vec<Range<u64>>> {
+    pub fn functions(&self) -> Result<Arc<[Range<u64>]>> {
+        self.functions
+            .get_or_init(|| {
+                self.read_functions()
+                    .map(Arc::from)
+                    .map_err(|error| error.to_string())
+            })
+            .as_ref()
+            .cloned()
+            .map_err(|error| error.clone().into())
+    }
+
+    fn read_functions(&self) -> Result<Vec<Range<u64>>> {
+        if let object::File::MachO64(file) = &self.file {
+            let mut commands = file.macho_load_commands()?;
+            while let Some(command) = commands.next()? {
+                if command.cmd() != macho::LC_FUNCTION_STARTS {
+                    continue;
+                }
+                let command = command.data::<macho::LinkeditDataCommand<object::Endianness>>()?;
+                let starts = command
+                    .function_starts(file.endian(), file.data(), self.base())?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let sections = file
+                    .sections()
+                    .filter(|section| section.kind() == SectionKind::Text)
+                    .map(|section| {
+                        Ok(section.address()
+                            ..section
+                                .address()
+                                .checked_add(section.size())
+                                .ok_or("代码节地址溢出")?)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                return starts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &start)| {
+                        let section = sections
+                            .iter()
+                            .find(|section| section.contains(&start))
+                            .ok_or("函数起点不在代码节中")?;
+                        let end = starts.get(index + 1).copied().unwrap_or(section.end);
+                        Ok(start..end.min(section.end))
+                    })
+                    .collect();
+            }
+            return Err("找不到 Mach-O 函数起点表".into());
+        }
         let mut functions = Vec::new();
         for entry in self.unwind()? {
             let start = u32::from_le_bytes(entry[..4].try_into()?) as u64;

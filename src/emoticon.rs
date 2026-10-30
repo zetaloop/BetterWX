@@ -224,7 +224,7 @@ fn callers(references: &References, address: u64) -> Vec<Range<u64>> {
 
 fn transfer(image: &Image<'_>, progress: &Progress) -> Result<u64> {
     let mut found = Vec::new();
-    for function in image.functions()? {
+    for function in image.functions()?.iter() {
         progress.check()?;
         let bytes = image.data(function.start, (function.end - function.start) as usize)?;
         let mut prefix = Decoder::with_ip(64, bytes, function.start, DecoderOptions::NONE)
@@ -271,7 +271,7 @@ fn transfer(image: &Image<'_>, progress: &Progress) -> Result<u64> {
         }) {
             continue;
         }
-        let body = image.instructions(&function)?;
+        let body = image.instructions(function)?;
         if calls(&body).next().is_some()
             || body.iter().any(|instruction| {
                 instruction.op0_kind() == OpKind::Memory
